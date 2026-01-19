@@ -25,7 +25,8 @@ import statsmodels.formula.api as smf
 from statsmodels.stats.anova import anova_lm
 from scipy import optimize
 
-from pyDOE2 import ff2n, fracfact, pbdesign, ccdesign, bbdesign, lhs
+from doepy import build
+
 
 
 # --------------------------
