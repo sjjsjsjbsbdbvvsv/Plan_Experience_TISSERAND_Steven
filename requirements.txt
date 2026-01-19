@@ -5,4 +5,3 @@ openpyxl
 statsmodels
 scipy
 matplotlib
-doepy
