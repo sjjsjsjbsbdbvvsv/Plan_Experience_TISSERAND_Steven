@@ -1,15 +1,5 @@
-# ============================================================
-# DOE PARAMETRABLE — V4 "niveau Minitab +" (Streamlit)
-# - Plans: Factoriel complet 2 niveaux, Fractionnaire (fracfact),
-#          Plackett–Burman (PB), RSM: CCD, Box–Behnken, LHS
-# - 100% dans l'app: saisie Y, analyse (ANOVA/diagnostics/effets),
-#   optimisation 1 ou multi-réponses (désirabilité)
-# - Projet: sauvegarde/chargement JSON
-# - Garde-fous: reset auto si nouveau plan, blocage (blocks), contrôle N vs modèle
-# ============================================================
-
-import json
 import io
+import json
 import re
 import hashlib
 from dataclasses import dataclass, asdict
@@ -23,22 +13,28 @@ import matplotlib.pyplot as plt
 import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from statsmodels.stats.anova import anova_lm
-from scipy import optimize
 
-from doepy import build
+from itertools import product
+from scipy.linalg import hadamard
+from scipy.stats import qmc
 
 
+# ============================================================
+# DOE PARAMETRABLE — V4 (Python 3.13 compatible)
+# - Plans: Full factorial 2-level, Fractional (simple generator),
+#          Screening (Hadamard), RSM (CCD, Box-Behnken), LHS
+# - 100% in-app: run sheet + results + analysis + optimization
+# - Project save/load JSON
+# - Auto-reset when new plan is generated
+# ============================================================
 
-# --------------------------
-# UI CONFIG
-# --------------------------
 st.set_page_config(page_title="DOE complet (V4)", layout="wide")
 st.title("DOE complet — Plans + Saisie + Analyse + Optimisation (V4)")
 
 
-# --------------------------
-# DATA MODELS
-# --------------------------
+# ----------------------------
+# Data models
+# ----------------------------
 @dataclass
 class Factor:
     name: str
@@ -46,31 +42,29 @@ class Factor:
     low: Optional[float] = None
     high: Optional[float] = None
     step: float = 0.0
-    levels: Optional[List[str]] = None  # for cat
+    levels: Optional[List[str]] = None  # for cat (2 levels)
 
 
 @dataclass
 class DesignConfig:
     design_type: str
-    random_seed: int
-    replicates: int
-    center_points: int
-    n_blocks: int
-    randomize_within_block: bool
-    randomize_global: bool
+    random_seed: int = 42
+    replicates: int = 1
+    center_points: int = 0
+    n_blocks: int = 1
+    randomize_within_block: bool = True
+    randomize_global: bool = True
     # Fractionnaire
-    frac_generator: str = ""  # ex: "a b c ab ac"
-    # CCD / RSM
-    ccd_center: int = 4
-    ccd_alpha: str = "rotatable"  # rotatable / face-centered
-    ccd_face: str = "circumscribed"  # circumscribed / inscribed / faced
+    frac_generator: str = "a b c ab ac"
+    # CCD
+    ccd_alpha: str = "rotatable"  # "rotatable" or "face-centered"
     # LHS
     lhs_samples: int = 20
 
 
-# --------------------------
-# STATE
-# --------------------------
+# ----------------------------
+# Session state
+# ----------------------------
 def ensure_state():
     defaults = {
         "plan_id": 0,
@@ -78,7 +72,7 @@ def ensure_state():
         "design_cfg": None,
         "doe_coded": None,
         "doe_real": None,
-        "results": None,            # includes Y columns + status
+        "results": None,
         "y_cols": ["Y"],
         "analysis_cache": None,
         "analysis_cache_key": None,
@@ -88,36 +82,36 @@ def ensure_state():
             st.session_state[k] = v
 
 
-def reset_everything_for_new_plan(df_real: pd.DataFrame, df_coded: pd.DataFrame):
-    """Reset complet (résultats + analyse) quand un nouveau plan est généré."""
+ensure_state()
+
+
+def reset_everything_for_new_plan(df_real: pd.DataFrame, df_coded: pd.DataFrame, cfg: DesignConfig, factors: List[Factor]):
+    """Auto-reset results + analysis when generating a new plan (prevents mixing designs)."""
     st.session_state.plan_id += 1
+    st.session_state.design_cfg = cfg
+    st.session_state.factors = factors
     st.session_state.doe_real = df_real
     st.session_state.doe_coded = df_coded
 
-    # Reset réponses
+    # Reset responses
     st.session_state.y_cols = ["Y"]
-
     res = df_real.copy()
     res["Done"] = False
     res["Comment"] = ""
     res["Y"] = np.nan
     st.session_state.results = res
 
-    # Reset analyse
+    # Reset analysis cache
     st.session_state.analysis_cache = None
     st.session_state.analysis_cache_key = None
 
 
-ensure_state()
-
-
-# --------------------------
-# UTILS
-# --------------------------
+# ----------------------------
+# Utils
+# ----------------------------
 def sanitize_name(name: str, default: str = "X") -> str:
     name = (name or "").strip()
     name = name.replace(" ", "_")
-    # évite caractères bizarres
     name = re.sub(r"[^0-9a-zA-Z_]", "_", name)
     return name if name else default
 
@@ -146,7 +140,7 @@ def repeat_df(df: pd.DataFrame, reps: int) -> pd.DataFrame:
 
 
 def apply_blocking(df_real: pd.DataFrame, df_coded: pd.DataFrame, n_blocks: int, seed: int, randomize_within_block: bool):
-    """Ajoute Block et randomise dans chaque bloc si demandé."""
+    """Add Block and randomize within each block if requested."""
     df_real = df_real.copy()
     df_coded = df_coded.copy()
 
@@ -162,41 +156,36 @@ def apply_blocking(df_real: pd.DataFrame, df_coded: pd.DataFrame, n_blocks: int,
 
     if randomize_within_block:
         rng = np.random.RandomState(seed)
-        idx_parts = []
+        idx = []
         for b in range(1, n_blocks + 1):
             idx_b = df_real.index[df_real["Block"] == b].to_list()
             rng.shuffle(idx_b)
-            idx_parts.extend(idx_b)
-        df_real = df_real.loc[idx_parts].reset_index(drop=True)
-        df_coded = df_coded.loc[idx_parts].reset_index(drop=True)
+            idx.extend(idx_b)
+        df_real = df_real.loc[idx].reset_index(drop=True)
+        df_coded = df_coded.loc[idx].reset_index(drop=True)
 
     return df_real, df_coded
 
 
 def coded_to_real_quant(coded: np.ndarray, low: float, high: float) -> np.ndarray:
-    """Map codé -> réel via interpolation linéaire. Fonctionne aussi si codé dépasse [-1,1] (CCD)."""
-    # coded=-1 -> low, coded=+1 -> high
+    """Map coded -> real (supports coded beyond [-1,1] for CCD axial points)."""
     return low + (coded + 1.0) * (high - low) / 2.0
 
 
 def build_real_from_coded(df_coded: pd.DataFrame, factors: List[Factor]) -> pd.DataFrame:
-    """Convertit colonnes codées en valeurs réelles (quant) + labels (cat)."""
+    """Convert coded design to real values."""
     df_real = df_coded.copy()
-
     for f in factors:
         if f.kind == "quant":
-            col = f.name
-            df_real[col] = coded_to_real_quant(df_coded[col].values.astype(float), float(f.low), float(f.high))
-            df_real[col] = round_to_step(df_real[col].values.astype(float), float(f.step))
+            x = coded_to_real_quant(df_coded[f.name].astype(float).values, float(f.low), float(f.high))
+            x = round_to_step(x, float(f.step))
+            df_real[f.name] = x
         else:
-            # Catégoriel: pour l’instant support 2 niveaux (PB/factoriel/etc)
-            # codé -1/+1 => levels[0]/levels[1]
-            col = f.name
-            levels = f.levels or ["A", "B"]
-            if len(levels) < 2:
-                levels = levels + ["B"]
-            df_real[col] = np.where(df_coded[col].values.astype(float) >= 0, levels[1], levels[0])
-
+            # categorical (2 levels): -1 => levels[0], +1/0 => levels[1] (0 treated as high level for simplicity)
+            lv = f.levels or ["A", "B"]
+            if len(lv) < 2:
+                lv = lv + ["B"]
+            df_real[f.name] = np.where(df_coded[f.name].astype(float).values >= 0, lv[1], lv[0])
     return df_real
 
 
@@ -207,63 +196,162 @@ def make_excel_bytes(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
-# --------------------------
-# DOE GENERATION (CODED)
-# --------------------------
+def is_two_level_only(df_coded: pd.DataFrame, factor_cols: List[str]) -> bool:
+    """True if all factor columns only contain -1 and +1 (no 0, no alpha)."""
+    for c in factor_cols:
+        vals = set(pd.Series(df_coded[c]).dropna().unique().tolist())
+        if not vals.issubset({-1.0, 1.0}):
+            return False
+    return True
+
+
+# ----------------------------
+# Design generation (coded)
+# ----------------------------
+def _ff2n(k: int) -> np.ndarray:
+    return np.array(list(product([-1.0, 1.0], repeat=k)), dtype=float)
+
+
+def _fracfact_simple(generator_terms: List[str]) -> np.ndarray:
+    """
+    Simple fractional factorial from terms like: a b c ab ac
+    - Determine base letters from union of letters in terms
+    - Generate full factorial on base letters
+    - Each term = product of corresponding base columns
+    """
+    terms = [t.strip().lower() for t in generator_terms if t.strip()]
+    if not terms:
+        raise ValueError("Generator vide. Exemple: 'a b c ab ac'")
+
+    letters = sorted(set("".join(terms)))
+    letters = [ch for ch in letters if ch.isalpha()]
+    p = len(letters)
+    if p == 0:
+        raise ValueError("Generator invalide (pas de lettres).")
+
+    base = _ff2n(p)
+    base_df = pd.DataFrame(base, columns=letters)
+
+    cols = []
+    for t in terms:
+        t = "".join([ch for ch in t if ch.isalpha()])
+        v = np.ones(len(base_df), dtype=float)
+        for ch in t:
+            v *= base_df[ch].values
+        cols.append(v)
+
+    return np.column_stack(cols).astype(float)
+
+
+def _screening_hadamard(k: int) -> np.ndarray:
+    """
+    Screening design based on Hadamard:
+    - N = smallest power of 2 >= k+1
+    - Use columns 1..k (skip first all-ones column)
+    """
+    N = 1
+    while N < (k + 1):
+        N *= 2
+    H = hadamard(N).astype(float)
+    return H[:, 1:k+1]
+
+
+def _ccd_design(k: int, center_points: int = 0, alpha_mode: str = "rotatable") -> np.ndarray:
+    """
+    CCD coded design:
+    - factorial points: +/-1 (2^k)
+    - axial points: +/-alpha on each axis (2k)
+    - center points: 0
+    alpha rotatable ~ sqrt(k), face-centered alpha=1
+    """
+    alpha = 1.0 if alpha_mode == "face-centered" else float(np.sqrt(k))
+
+    factorial = _ff2n(k)
+    axial = []
+    for i in range(k):
+        v = np.zeros(k, dtype=float)
+        v[i] = alpha
+        axial.append(v.copy())
+        v[i] = -alpha
+        axial.append(v.copy())
+    axial = np.array(axial, dtype=float)
+
+    center = np.zeros((int(center_points), k), dtype=float) if center_points > 0 else np.zeros((0, k), dtype=float)
+    return np.vstack([factorial, axial, center])
+
+
+def _bb_design(k: int, center_points: int = 0) -> np.ndarray:
+    """
+    Box–Behnken coded design:
+    - For each pair (i,j): 4 points (±1,±1) on i,j, others 0
+    - + center points
+    Requires k >= 3
+    """
+    if k < 3:
+        raise ValueError("Box–Behnken nécessite au moins 3 facteurs.")
+    runs = []
+    for i in range(k):
+        for j in range(i + 1, k):
+            for si in [-1.0, 1.0]:
+                for sj in [-1.0, 1.0]:
+                    v = np.zeros(k, dtype=float)
+                    v[i] = si
+                    v[j] = sj
+                    runs.append(v)
+    X = np.array(runs, dtype=float)
+    if center_points > 0:
+        X = np.vstack([X, np.zeros((int(center_points), k), dtype=float)])
+    return X
+
+
+def _lhs_design(k: int, samples: int = 20, seed: int = 42) -> np.ndarray:
+    """Latin Hypercube in [-1, 1]."""
+    sampler = qmc.LatinHypercube(d=k, seed=seed)
+    X01 = sampler.random(n=int(samples))
+    return (2 * X01 - 1).astype(float)
+
+
 def generate_coded_matrix(design_type: str, factor_names: List[str], cfg: DesignConfig) -> pd.DataFrame:
     k = len(factor_names)
 
     if design_type == "Factoriel complet (2 niveaux)":
-        X = ff2n(k)  # -1/+1
+        X = _ff2n(k)
         return pd.DataFrame(X, columns=factor_names)
 
     if design_type == "Fractionnaire (2 niveaux)":
-        # cfg.frac_generator doit contenir une formule fracfact
-        # Ex: "a b c ab ac" -> 5 colonnes, mais on gère k colonnes => il faut fournir k termes
         gen = (cfg.frac_generator or "").strip()
         if not gen:
             raise ValueError("Generator fractionnaire vide. Exemple: 'a b c ab ac'.")
-        X = fracfact(gen)  # -1/+1
-        df = pd.DataFrame(X, columns=[f"x{i+1}" for i in range(X.shape[1])])
+        terms = gen.split()
+        X = _fracfact_simple(terms)
         if X.shape[1] != k:
             raise ValueError(f"Le generator crée {X.shape[1]} colonnes, mais tu as {k} facteurs.")
-        df.columns = factor_names
-        return df
+        return pd.DataFrame(X, columns=factor_names)
 
-    if design_type == "Plackett–Burman (screening)":
-        X = pbdesign(k)  # -1/+1, N = multiple of 4
+    if design_type == "Screening (Hadamard)":
+        X = _screening_hadamard(k)
         return pd.DataFrame(X, columns=factor_names)
 
     if design_type == "CCD (RSM)":
-        # ccdesign: renvoie niveaux codés incluant alpha, 0, +/-1
-        # center=(nc, nc) par défaut: points centraux (factoriels, axiaux)
-        alpha_map = {"rotatable": "rotatable", "face-centered": "faced"}
-        alpha = alpha_map.get(cfg.ccd_alpha, "rotatable")
-        # ccdesign uses alpha parameter values: 'rotatable', 'orthogonal', or numeric
-        # for face-centered we can set alpha=1 and face='faced'
-        if cfg.ccd_alpha == "face-centered":
-            X = ccdesign(k, center=(cfg.center_points, cfg.center_points), alpha=1, face="faced")
-        else:
-            X = ccdesign(k, center=(cfg.center_points, cfg.center_points), alpha="rotatable", face=cfg.ccd_face)
+        X = _ccd_design(k, center_points=cfg.center_points, alpha_mode=cfg.ccd_alpha)
         return pd.DataFrame(X, columns=factor_names)
 
     if design_type == "Box–Behnken (RSM)":
-        X = bbdesign(k, center=cfg.center_points)  # -1/0/+1
+        X = _bb_design(k, center_points=cfg.center_points)
         return pd.DataFrame(X, columns=factor_names)
 
     if design_type == "LHS (exploration)":
-        X = lhs(k, samples=cfg.lhs_samples, criterion="center")  # in [0,1]
-        # Convert [0,1] -> [-1,1] for consistent mapping
-        X = 2 * X - 1
+        X = _lhs_design(k, samples=cfg.lhs_samples, seed=cfg.random_seed)
         return pd.DataFrame(X, columns=factor_names)
 
     raise ValueError("Type de plan non supporté.")
 
 
-# --------------------------
-# EFFECTS / PARETO
-# --------------------------
-def compute_effects(df_coded: pd.DataFrame, y: pd.Series, include_interactions: bool = True) -> pd.DataFrame:
+# ----------------------------
+# Analysis helpers
+# ----------------------------
+def compute_effects_two_level(df_coded: pd.DataFrame, y: pd.Series, include_interactions: bool = True) -> pd.DataFrame:
+    """DOE effects (difference of means) for 2-level designs only."""
     tmp = df_coded.copy()
     tmp["_Y_"] = y.values
 
@@ -286,36 +374,46 @@ def compute_effects(df_coded: pd.DataFrame, y: pd.Series, include_interactions: 
 
     eff = pd.DataFrame(effects, columns=["Terme", "Effet"])
     eff["|Effet|"] = eff["Effet"].abs()
-    eff = eff.sort_values("|Effet|", ascending=False).reset_index(drop=True)
-    return eff
+    return eff.sort_values("|Effet|", ascending=False).reset_index(drop=True)
 
 
-# --------------------------
-# MODEL BUILDING
-# --------------------------
-def build_formula(y_col: str, factors: List[Factor], include_interactions: bool, include_quadratic: bool, include_block: bool) -> str:
-    # quant factors appear as numeric; categorical as C(name)
+def standardized_coeff_pareto(model) -> pd.DataFrame:
+    """
+    For non-2level designs (RSM), we provide a pareto-like ranking using
+    |t| or |coef/std_err| (t-values) from the fitted model.
+    """
+    tvals = model.tvalues.copy()
+    tvals = tvals.drop(labels=["Intercept"], errors="ignore")
+    df = pd.DataFrame({"Terme": tvals.index, "|t|": np.abs(tvals.values)})
+    return df.sort_values("|t|", ascending=False).reset_index(drop=True)
+
+
+def build_formula(y_col: str, factors: List[Factor], include_inter: bool, include_quad: bool, include_block: bool) -> str:
     x_terms = []
-    quant_names = []
+    quant = []
     for f in factors:
         if f.kind == "quant":
             x_terms.append(f.name)
-            quant_names.append(f.name)
+            quant.append(f.name)
         else:
             x_terms.append(f"C({f.name})")
 
     base = " + ".join(x_terms) if x_terms else "1"
     formula = f"{y_col} ~ {base}"
 
-    # interactions: only among quant for now (stable + performant)
-    if include_interactions and len(quant_names) >= 2:
-        inter = " + ".join([f"{quant_names[i]}:{quant_names[j]}" for i in range(len(quant_names)) for j in range(i+1, len(quant_names))])
-        formula += " + " + inter
+    # interactions among quantitative factors only (stable)
+    if include_inter and len(quant) >= 2:
+        inter_terms = []
+        for i in range(len(quant)):
+            for j in range(i + 1, len(quant)):
+                inter_terms.append(f"{quant[i]}:{quant[j]}")
+        if inter_terms:
+            formula += " + " + " + ".join(inter_terms)
 
-    # quadratic: only quant (RSM)
-    if include_quadratic and len(quant_names) >= 1:
-        quad = " + ".join([f"I({q}**2)" for q in quant_names])
-        formula += " + " + quad
+    # quadratic for quantitative factors
+    if include_quad and len(quant) >= 1:
+        quad_terms = [f"I({q}**2)" for q in quant]
+        formula += " + " + " + ".join(quad_terms)
 
     if include_block:
         formula += " + C(Block)"
@@ -323,37 +421,10 @@ def build_formula(y_col: str, factors: List[Factor], include_interactions: bool,
     return formula
 
 
-def backward_elimination(model, alpha=0.10):
-    """Simple backward elimination: drop the worst p-value term iteratively (except intercept)."""
-    current = model
-    while True:
-        pvals = current.pvalues.drop(labels=["Intercept"], errors="ignore")
-        if len(pvals) == 0:
-            break
-        worst_term = pvals.idxmax()
-        worst_p = pvals.max()
-        if worst_p <= alpha:
-            break
-        # rebuild formula without worst_term
-        # WARNING: simple string removal can be tricky; on reste prudent:
-        formula = current.model.formula
-        # remove " + worst_term" or worst at ends
-        formula2 = re.sub(rf"\s*\+\s*{re.escape(worst_term)}\s*", " + ", formula)
-        formula2 = re.sub(r"\+\s*\+\s*", "+", formula2)
-        formula2 = formula2.replace("~ +", "~")
-        formula2 = re.sub(r"\s+", " ", formula2).strip()
-        try:
-            current = smf.ols(formula=formula2, data=current.model.data.frame).fit()
-        except Exception:
-            break
-    return current
-
-
-# --------------------------
-# OPTIMIZATION (DESIRABILITY)
-# --------------------------
-def desirability_single(y_pred: float, goal: str, low: float, high: float, target: float = None) -> float:
-    """Desirability 0..1."""
+# ----------------------------
+# Optimization (desirability)
+# ----------------------------
+def desirability_single(y_pred: float, goal: str, low: float, high: float, target: Optional[float] = None) -> float:
     if goal == "Maximiser":
         if y_pred <= low: return 0.0
         if y_pred >= high: return 1.0
@@ -362,6 +433,7 @@ def desirability_single(y_pred: float, goal: str, low: float, high: float, targe
         if y_pred >= high: return 0.0
         if y_pred <= low: return 1.0
         return (high - y_pred) / (high - low)
+
     # Cibler
     if target is None:
         target = (low + high) / 2
@@ -380,10 +452,6 @@ def predict_from_model(model, x_dict: Dict[str, float]) -> float:
 
 
 def optimize_desirability(models: Dict[str, object], factors: List[Factor], goals: Dict[str, dict], n_samples: int = 2000, seed: int = 42):
-    """
-    Random search (robuste) + local polish (optionnel).
-    - factors: quant only for optimization (on ignore cat ici)
-    """
     rng = np.random.RandomState(seed)
     quant = [f for f in factors if f.kind == "quant"]
     if not quant:
@@ -392,29 +460,32 @@ def optimize_desirability(models: Dict[str, object], factors: List[Factor], goal
     lows = np.array([float(f.low) for f in quant])
     highs = np.array([float(f.high) for f in quant])
 
-    best = None
-    bestD = -1
+    bestD = -1.0
+    best_x = None
+    best_preds = None
 
-    # random search
-    X = rng.uniform(lows, highs, size=(n_samples, len(quant)))
+    X = rng.uniform(lows, highs, size=(int(n_samples), len(quant)))
     for row in X:
         x = {quant[i].name: float(row[i]) for i in range(len(quant))}
-        D_list = []
+        d_list = []
+        preds = {}
         for yname, model in models.items():
             yp = predict_from_model(model, x)
+            preds[yname] = yp
             g = goals[yname]
             d = desirability_single(yp, g["goal"], g["low"], g["high"], g.get("target"))
-            D_list.append(d ** g.get("weight", 1.0))
-        D = float(np.prod(D_list) ** (1.0 / max(1, len(D_list))))
+            d_list.append(d ** g.get("weight", 1.0))
+        D = float(np.prod(d_list) ** (1.0 / max(1, len(d_list))))
         if D > bestD:
             bestD = D
-            best = (x, {yname: predict_from_model(models[yname], x) for yname in models.keys()})
+            best_x = x
+            best_preds = preds
 
-    return bestD, best
+    return bestD, best_x, best_preds
 
 
 # ============================================================
-# SIDEBAR — NAV (UX)
+# UI NAV
 # ============================================================
 st.sidebar.markdown("## Navigation")
 step = st.sidebar.radio(
@@ -422,19 +493,16 @@ step = st.sidebar.radio(
     ["Projet", "Facteurs", "Plan", "Exécution", "Analyse", "Optimisation", "Rapport"],
     index=2
 )
-
 st.sidebar.markdown("---")
-st.sidebar.caption("Astuce: l'app *réinitialise* résultats+analyse à chaque nouveau plan pour éviter les mélanges.")
+st.sidebar.caption("Nouveau plan ⇒ reset Exécution + Analyse (automatique).")
 
 
 # ============================================================
-# 0) PROJET (save/load)
+# 0) PROJET
 # ============================================================
 if step == "Projet":
-    st.subheader("Projet")
-    st.write("Ici tu peux **sauvegarder** l’état du projet (facteurs, plan, résultats) et **recharger** plus tard.")
+    st.subheader("Projet — sauvegarder / charger")
 
-    # Save
     if st.session_state.results is not None and st.session_state.doe_real is not None:
         project = {
             "factors": [asdict(f) for f in st.session_state.factors],
@@ -444,14 +512,12 @@ if step == "Projet":
             "results": st.session_state.results.to_dict(orient="list"),
             "y_cols": st.session_state.y_cols,
         }
-        bytes_json = json.dumps(project, ensure_ascii=False).encode("utf-8")
-        st.download_button("Télécharger le projet (.json)", bytes_json, file_name="doe_project.json", mime="application/json")
+        b = json.dumps(project, ensure_ascii=False).encode("utf-8")
+        st.download_button("Télécharger le projet (.json)", b, file_name="doe_project.json", mime="application/json")
     else:
-        st.info("Génère un plan d’abord (étapes Facteurs + Plan), puis tu pourras sauvegarder.")
+        st.info("Génère un plan (Facteurs → Plan) pour pouvoir sauvegarder.")
 
     st.markdown("---")
-
-    # Load
     up = st.file_uploader("Charger un projet (.json)", type=["json"])
     if up is not None:
         try:
@@ -459,18 +525,15 @@ if step == "Projet":
             st.session_state.factors = [Factor(**f) for f in proj.get("factors", [])]
             dc = proj.get("design_cfg")
             st.session_state.design_cfg = DesignConfig(**dc) if dc else None
-
             st.session_state.doe_real = pd.DataFrame(proj.get("doe_real"))
             st.session_state.doe_coded = pd.DataFrame(proj.get("doe_coded")) if proj.get("doe_coded") else None
             st.session_state.results = pd.DataFrame(proj.get("results"))
             st.session_state.y_cols = proj.get("y_cols", ["Y"])
-
-            # reset caches (sécurité)
             st.session_state.analysis_cache = None
             st.session_state.analysis_cache_key = None
             st.success("Projet chargé ✅")
         except Exception as e:
-            st.error(f"Impossible de charger ce projet: {e}")
+            st.error(f"Erreur chargement projet: {e}")
 
 
 # ============================================================
@@ -478,51 +541,51 @@ if step == "Projet":
 # ============================================================
 if step == "Facteurs":
     st.subheader("Facteurs")
-    st.write("Définis tes facteurs. **Quantitatif** (bornes + pas) ou **Qualitatif (2 niveaux)**.")
+    st.write("Définis tes facteurs. Quantitatif (bornes + pas) ou Qualitatif (2 niveaux).")
 
-    colA, colB = st.columns([1, 2])
-    with colA:
-        n_factors = st.number_input("Nombre de facteurs", 1, 20, 3, 1)
-        st.caption("Conseil: pour les qualitatifs, commence simple (2 niveaux).")
+    n_factors = st.number_input("Nombre de facteurs", 1, 25, 3, 1)
 
     factors: List[Factor] = []
-    issues = False
-    with colB:
-        for i in range(int(n_factors)):
-            st.markdown(f"### Facteur {i+1}")
-            c1, c2, c3 = st.columns([2, 2, 2])
-            with c1:
-                name = sanitize_name(st.text_input("Nom", value=f"X{i+1}", key=f"fx_name_{i}"), default=f"X{i+1}")
-            with c2:
-                kind = st.selectbox("Type", ["quant", "cat"], index=0, key=f"fx_kind_{i}")
-            with c3:
-                step = float(st.number_input("Pas/arrondi (quant)", value=0.0, min_value=0.0, key=f"fx_step_{i}"))
+    any_issue = False
 
-            if kind == "quant":
-                c4, c5 = st.columns([1, 1])
-                with c4:
-                    low = float(st.number_input("Bas", value=0.0, key=f"fx_low_{i}"))
-                with c5:
-                    high = float(st.number_input("Haut", value=1.0, key=f"fx_high_{i}"))
-                if high == low:
-                    issues = True
-                    st.warning("Bas = Haut (corrige).")
-                factors.append(Factor(name=name, kind="quant", low=low, high=high, step=step))
-            else:
-                lv1 = st.text_input("Niveau bas (-1)", value="A", key=f"fx_lv1_{i}")
-                lv2 = st.text_input("Niveau haut (+1)", value="B", key=f"fx_lv2_{i}")
-                factors.append(Factor(name=name, kind="cat", levels=[lv1, lv2]))
+    for i in range(int(n_factors)):
+        st.markdown(f"### Facteur {i+1}")
+        c1, c2, c3 = st.columns([2, 2, 2])
+        with c1:
+            name = sanitize_name(st.text_input("Nom", value=f"X{i+1}", key=f"fx_name_{i}"), default=f"X{i+1}")
+        with c2:
+            kind = st.selectbox("Type", ["quant", "cat"], index=0, key=f"fx_kind_{i}")
+        with c3:
+            stepv = float(st.number_input("Pas/arrondi (quant)", value=0.0, min_value=0.0, key=f"fx_step_{i}"))
 
-    st.session_state.factors = factors
-    st.success("Facteurs enregistrés ✅ (passe à l’étape Plan)")
+        if kind == "quant":
+            c4, c5 = st.columns([1, 1])
+            with c4:
+                low = float(st.number_input("Bas", value=0.0, key=f"fx_low_{i}"))
+            with c5:
+                high = float(st.number_input("Haut", value=1.0, key=f"fx_high_{i}"))
+            if high == low:
+                any_issue = True
+                st.warning("⚠️ Bas = Haut (corrige).")
+            factors.append(Factor(name=name, kind="quant", low=low, high=high, step=stepv))
+        else:
+            lv1 = st.text_input("Niveau bas (-1)", value="A", key=f"fx_lv1_{i}")
+            lv2 = st.text_input("Niveau haut (+1)", value="B", key=f"fx_lv2_{i}")
+            factors.append(Factor(name=name, kind="cat", levels=[lv1, lv2]))
+
+    if any_issue:
+        st.error("Corrige d’abord les facteurs quantitatifs où Bas = Haut.")
+    else:
+        st.session_state.factors = factors
+        st.success("Facteurs enregistrés ✅ (passe à Plan)")
 
 
 # ============================================================
 # 2) PLAN
 # ============================================================
 if step == "Plan":
-    st.subheader("Plan d’expérience")
-    st.write("Choisis le type de plan. L’app génère la matrice, applique réplicats/points centraux/blocs, puis réinitialise Exécution+Analyse.")
+    st.subheader("Plan d'expérience")
+    st.write("Choisis le type de plan. L’app génère le DOE, applique blocs/randomisation, puis reset Exécution+Analyse.")
 
     if not st.session_state.factors:
         st.warning("Définis d’abord les facteurs (étape Facteurs).")
@@ -530,17 +593,16 @@ if step == "Plan":
 
     factors = st.session_state.factors
     factor_names = [f.name for f in factors]
-    k = len(factors)
+    k = len(factor_names)
 
     left, right = st.columns([1, 2])
-
     with left:
         design_type = st.selectbox(
             "Type de plan",
             [
                 "Factoriel complet (2 niveaux)",
                 "Fractionnaire (2 niveaux)",
-                "Plackett–Burman (screening)",
+                "Screening (Hadamard)",
                 "CCD (RSM)",
                 "Box–Behnken (RSM)",
                 "LHS (exploration)",
@@ -548,77 +610,70 @@ if step == "Plan":
             index=0
         )
 
-        random_seed = st.number_input("Graine (random)", 0, 10000, 42, 1)
+        seed = st.number_input("Graine (random)", 0, 10000, 42, 1)
         replicates = st.number_input("Réplicats", 1, 50, 1, 1)
-        center_points = st.number_input("Points centraux", 0, 50, 0, 1)
+        center_points = st.number_input("Points centraux (selon plan)", 0, 50, 0, 1)
 
         st.markdown("### Blocage (Blocks)")
-        n_blocks = st.number_input("Nombre de blocs", 1, 20, 1, 1)
+        n_blocks = st.number_input("Nombre de blocs", 1, 30, 1, 1)
         randomize_within_block = st.checkbox("Randomiser dans chaque bloc", value=True)
         randomize_global = st.checkbox("Randomiser global (si pas de blocs)", value=True)
 
-        frac_generator = ""
+        frac_gen = "a b c ab ac"
         ccd_alpha = "rotatable"
-        ccd_face = "circumscribed"
         lhs_samples = 20
 
         if design_type == "Fractionnaire (2 niveaux)":
-            st.markdown("### Fractionnaire — generator")
-            st.caption("Exemple (5 facteurs): `a b c ab ac`  (doit produire exactement k colonnes).")
-            frac_generator = st.text_input("Generator fracfact", value="a b c ab ac", help="Doit créer k colonnes.")
+            st.caption("Exemple (5 facteurs): `a b c ab ac` (doit produire exactement k colonnes).")
+            frac_gen = st.text_input("Generator", value="a b c ab ac")
 
         if design_type == "CCD (RSM)":
-            st.markdown("### CCD — options")
             ccd_alpha = st.selectbox("Alpha", ["rotatable", "face-centered"], index=0)
-            ccd_face = st.selectbox("Face", ["circumscribed", "inscribed", "faced"], index=0)
 
         if design_type == "LHS (exploration)":
             lhs_samples = st.number_input("Nb d'échantillons", 5, 500, 20, 1)
 
-    # preview runs
     with right:
-        # Estimate runs quickly (rough)
-        est = "?"
+        # quick estimates (informative)
         if design_type == "Factoriel complet (2 niveaux)":
-            est = (2**k + center_points) * replicates
-        elif design_type == "Plackett–Burman (screening)":
-            # pbdesign gives N multiple of 4 >= k+1 (roughly)
-            est = "≈ multiple de 4"
-        elif design_type == "Box–Behnken (RSM)":
-            est = "BB = 2k(k-1)+center"
+            est = (2 ** k + center_points) * replicates
+        elif design_type == "Screening (Hadamard)":
+            N = 1
+            while N < (k + 1):
+                N *= 2
+            est = f"{N} essais (puissance de 2)"
         elif design_type == "CCD (RSM)":
-            est = "CCD ≈ 2^k + 2k + centers"
+            est = f"{2**k + 2*k + center_points} (approx)"
+        elif design_type == "Box–Behnken (RSM)":
+            est = f"{2*k*(k-1) + center_points} (approx)"
         elif design_type == "LHS (exploration)":
             est = lhs_samples * replicates
+        else:
+            est = "selon generator"
         st.info(f"Estimation essais: {est}")
-
-        st.caption("Garde-fou: un nouveau plan ⇒ reset Exécution/Analyse automatiquement.")
 
         cfg = DesignConfig(
             design_type=design_type,
-            random_seed=int(random_seed),
+            random_seed=int(seed),
             replicates=int(replicates),
             center_points=int(center_points),
             n_blocks=int(n_blocks),
             randomize_within_block=bool(randomize_within_block),
             randomize_global=bool(randomize_global),
-            frac_generator=frac_generator,
+            frac_generator=frac_gen,
             ccd_alpha=ccd_alpha,
-            ccd_face=ccd_face,
             lhs_samples=int(lhs_samples),
         )
 
         if st.button("✅ Générer le plan (reset Exécution+Analyse)"):
-            # Build coded matrix
             try:
                 df_coded = generate_coded_matrix(design_type, factor_names, cfg)
             except Exception as e:
                 st.error(f"Erreur génération plan: {e}")
                 st.stop()
 
-            # Add optional center points (for plans that don't already include them)
-            # For CCD/BB: they already include center; but we allow extra centers by repeating rows at 0.
-            if design_type in ["Factoriel complet (2 niveaux)", "Fractionnaire (2 niveaux)", "Plackett–Burman (screening)", "LHS (exploration)"]:
+            # Add extra center points ONLY for plans that do not already contain centers structurally
+            if design_type in ["Factoriel complet (2 niveaux)", "Fractionnaire (2 niveaux)", "Screening (Hadamard)", "LHS (exploration)"]:
                 if cfg.center_points > 0:
                     centers = pd.DataFrame({name: 0.0 for name in factor_names}, index=range(cfg.center_points))
                     df_coded = pd.concat([df_coded, centers], ignore_index=True)
@@ -641,11 +696,9 @@ if step == "Plan":
             df_real = add_runorder(df_real)
             df_coded = add_runorder(df_coded)
 
-            # Save config + reset
-            st.session_state.design_cfg = cfg
-            reset_everything_for_new_plan(df_real, df_coded)
+            reset_everything_for_new_plan(df_real, df_coded, cfg, factors)
 
-            st.success("Plan généré ✅ (va à Exécution pour saisir les mesures)")
+            st.success("Plan généré ✅ Va à Exécution.")
             st.dataframe(st.session_state.doe_real, use_container_width=True)
 
             st.download_button("Télécharger CSV (optionnel)", st.session_state.doe_real.to_csv(index=False).encode("utf-8"),
@@ -656,25 +709,21 @@ if step == "Plan":
 
 
 # ============================================================
-# 3) EXECUTION (saisie dans l'app)
+# 3) EXECUTION
 # ============================================================
 if step == "Exécution":
-    st.subheader("Exécution (Run Sheet) — saisie des mesures dans l’app")
-    st.write(
-        "Tu peux cocher **Done**, ajouter un **Comment**, et saisir tes réponses **Y** directement. "
-        "Aucun Excel nécessaire."
-    )
+    st.subheader("Exécution — saisie des mesures dans l’app")
+    st.write("Remplis Done / Comment, et ajoute une ou plusieurs réponses Y.")
 
     if st.session_state.results is None:
-        st.warning("Génère un plan d’abord (étape Plan).")
+        st.warning("Génère un plan d’abord (Facteurs → Plan).")
         st.stop()
 
     c1, c2 = st.columns([2, 1])
-
     with c2:
         st.markdown("### Réponses (Y)")
         new_y = st.text_input("Ajouter une réponse", placeholder="Ex: Poids, Retrait, Y2", value="")
-        if st.button("➕ Ajouter une réponse"):
+        if st.button("➕ Ajouter"):
             ny = sanitize_name(new_y, default="")
             if not ny:
                 st.info("Nom vide.")
@@ -697,13 +746,11 @@ if step == "Exécution":
             st.success("Réponses vidées.")
 
         st.markdown("---")
-        st.caption("Conseil: remplis au moins une réponse Y pour lancer l’analyse.")
-
-        y_fill = {y: int(st.session_state.results[y].notna().sum()) for y in st.session_state.y_cols}
-        st.write("Remplissage Y:", y_fill)
+        st.caption("Remplissage:")
+        for y in st.session_state.y_cols:
+            st.write(f"- {y}: {int(st.session_state.results[y].notna().sum())}/{len(st.session_state.results)}")
 
     with c1:
-        st.markdown("### Tableau d’exécution (éditable)")
         edited = st.data_editor(
             st.session_state.results,
             use_container_width=True,
@@ -717,11 +764,8 @@ if step == "Exécution":
 # 4) ANALYSE
 # ============================================================
 if step == "Analyse":
-    st.subheader("Analyse — coefficients, ANOVA, effets, diagnostics")
-    st.write(
-        "Choisis une réponse Y, un modèle (main / interactions / quadratique), puis lance l’analyse. "
-        "L’app bloque automatiquement si le modèle est trop riche pour le nombre d’essais."
-    )
+    st.subheader("Analyse — modèle, ANOVA, Pareto, diagnostics")
+    st.write("Choisis une réponse Y et un modèle. L’app bloque si le modèle est trop riche pour N.")
 
     if st.session_state.results is None or st.session_state.doe_coded is None:
         st.warning("Génère un plan et saisis des résultats d’abord.")
@@ -734,48 +778,35 @@ if step == "Analyse":
     y_candidates = [y for y in st.session_state.y_cols if y in df_res.columns]
     y_col = st.selectbox("Réponse (Y)", options=y_candidates)
 
-    include_inter = st.checkbox("Inclure interactions (2 facteurs)", value=True)
-    include_quad = st.checkbox("Inclure termes quadratiques (RSM)", value=False)
-    include_block = st.checkbox("Inclure Block dans le modèle", value=True)
+    include_inter = st.checkbox("Interactions (quant-quant)", value=True)
+    include_quad = st.checkbox("Quadratique (RSM)", value=False)
+    include_block = st.checkbox("Inclure Block", value=True)
 
-    use_stepwise = st.checkbox("Simplifier le modèle (backward elimination)", value=False)
-    alpha_step = st.slider("Seuil p-value (si stepwise)", 0.01, 0.30, 0.10, 0.01)
-
-    # Keep rows where Y not null
     mask = df_res[y_col].notna()
     n_obs = int(mask.sum())
     if n_obs == 0:
-        st.warning("Aucune valeur Y renseignée. Va à Exécution.")
+        st.warning("Aucune valeur Y remplie. Va à Exécution.")
         st.stop()
 
     df_model = df_res.loc[mask].copy()
-
-    # Ensure Block exists
     if "Block" not in df_model.columns:
         df_model["Block"] = 1
 
     formula = build_formula(y_col, factors, include_inter, include_quad, include_block)
     st.code(formula)
 
-    # Guardrail: N vs parameters (approx)
-    # (We keep it simple: if N <= number of columns in design matrix, block)
+    # Guardrail using a quick fit to estimate parameters
     try:
-        # quick estimate using patsy design matrix via statsmodels
-        model_tmp = smf.ols(formula=formula, data=df_model).fit()
-        p = int(model_tmp.df_model) + 1
+        tmp_model = smf.ols(formula=formula, data=df_model).fit()
+        p = int(tmp_model.df_model) + 1
     except Exception:
-        p = 1 + len([f for f in factors if f.kind == "quant"]) * (3 if include_inter else 1)
+        p = 10
 
     if n_obs <= p:
         st.error(f"Pas assez d’essais pour ce modèle: N={n_obs} <= paramètres~{p}. Réduis le modèle ou ajoute essais.")
         st.stop()
 
-    # Cache key
-    cache_key = (
-        stable_hash_df(df_model[["RunOrder", "Block"] + [f.name for f in factors] + [y_col]].copy())
-        + f"|Y={y_col}|inter={include_inter}|quad={include_quad}|block={include_block}|step={use_stepwise}|a={alpha_step}"
-        + f"|plan_id={st.session_state.plan_id}"
-    )
+    cache_key = stable_hash_df(df_model[["RunOrder", "Block"] + [f.name for f in factors] + [y_col]]) + f"|{formula}|plan={st.session_state.plan_id}"
 
     if st.button("🚀 Lancer l’analyse"):
         if st.session_state.analysis_cache_key == cache_key and st.session_state.analysis_cache is not None:
@@ -783,21 +814,31 @@ if step == "Analyse":
         else:
             try:
                 model = smf.ols(formula=formula, data=df_model).fit()
-                if use_stepwise:
-                    model = backward_elimination(model, alpha=float(alpha_step))
-
                 try:
                     anova_tbl = anova_lm(model, typ=2)
                 except Exception:
                     anova_tbl = None
 
-                # Effects on coded (only numeric coded columns)
+                factor_cols = [f.name for f in factors]
                 coded_cols = [c for c in df_coded.columns if c not in ["RunOrder", "Block"]]
-                df_coded_used = df_coded.loc[mask.values, coded_cols].reset_index(drop=True)
-                y_used = df_res.loc[mask, y_col].reset_index(drop=True)
-                eff = compute_effects(df_coded_used, y_used, include_interactions=include_inter)
+                two_level = is_two_level_only(df_coded.loc[mask.values].reset_index(drop=True), coded_cols)
 
-                st.session_state.analysis_cache = {"model": model, "anova": anova_tbl, "effects": eff}
+                if two_level:
+                    eff = compute_effects_two_level(df_coded.loc[mask.values, coded_cols].reset_index(drop=True),
+                                                    df_res.loc[mask, y_col].reset_index(drop=True),
+                                                    include_interactions=include_inter)
+                else:
+                    eff = None
+
+                pareto_std = standardized_coeff_pareto(model)
+
+                st.session_state.analysis_cache = {
+                    "model": model,
+                    "anova": anova_tbl,
+                    "effects": eff,
+                    "pareto_std": pareto_std,
+                    "two_level": two_level
+                }
                 st.session_state.analysis_cache_key = cache_key
                 st.success("Analyse calculée ✅")
             except Exception as e:
@@ -810,8 +851,9 @@ if step == "Analyse":
     model = st.session_state.analysis_cache["model"]
     anova_tbl = st.session_state.analysis_cache["anova"]
     eff = st.session_state.analysis_cache["effects"]
+    pareto_std = st.session_state.analysis_cache["pareto_std"]
+    two_level = st.session_state.analysis_cache["two_level"]
 
-    # Results
     st.markdown("## Coefficients")
     coef = pd.DataFrame({"coef": model.params, "std_err": model.bse, "t": model.tvalues, "p_value": model.pvalues})
     st.dataframe(coef, use_container_width=True)
@@ -832,16 +874,27 @@ if step == "Analyse":
     else:
         st.dataframe(anova_tbl, use_container_width=True)
 
-    st.markdown("## Effets + Pareto")
-    st.dataframe(eff, use_container_width=True)
-
-    figp = plt.figure()
-    plt.bar(range(len(eff)), eff["|Effet|"].values)
-    plt.xticks(range(len(eff)), eff["Terme"].values, rotation=90)
-    plt.ylabel("|Effet|")
-    plt.title("Pareto des effets")
-    plt.tight_layout()
-    st.pyplot(figp)
+    st.markdown("## Pareto")
+    if two_level and eff is not None:
+        st.caption("Design 2 niveaux détecté → Pareto sur effets (différence de moyennes).")
+        st.dataframe(eff, use_container_width=True)
+        figp = plt.figure()
+        plt.bar(range(len(eff)), eff["|Effet|"].values)
+        plt.xticks(range(len(eff)), eff["Terme"].values, rotation=90)
+        plt.ylabel("|Effet|")
+        plt.title("Pareto des effets (DOE)")
+        plt.tight_layout()
+        st.pyplot(figp)
+    else:
+        st.caption("Design non 2 niveaux (ex: RSM) → Pareto basé sur |t| (coefficients standardisés).")
+        st.dataframe(pareto_std, use_container_width=True)
+        figp = plt.figure()
+        plt.bar(range(len(pareto_std)), pareto_std["|t|"].values)
+        plt.xticks(range(len(pareto_std)), pareto_std["Terme"].values, rotation=90)
+        plt.ylabel("|t|")
+        plt.title("Pareto (|t| des coefficients)")
+        plt.tight_layout()
+        st.pyplot(figp)
 
     st.markdown("## Diagnostics")
     resid = model.resid
@@ -869,37 +922,30 @@ if step == "Analyse":
 
 
 # ============================================================
-# 5) OPTIMISATION (1 ou multi Y)
+# 5) OPTIMISATION
 # ============================================================
 if step == "Optimisation":
-    st.subheader("Optimisation — 1 réponse ou multi-réponses (désirabilité)")
-    st.write(
-        "L’optimisation utilise le(s) modèle(s) ajusté(s). "
-        "Tu définis un objectif (Max/Min/Cible) et des bornes désirées."
-    )
+    st.subheader("Optimisation — 1 ou multi-réponses (désirabilité)")
+    st.write("L’optimisation utilise des modèles ajustés. Elle optimise uniquement les facteurs quantitatifs.")
 
     if st.session_state.results is None:
-        st.warning("Génère un plan, saisis des résultats, fais une analyse d’abord.")
+        st.warning("Génère un plan, saisis des données, puis analyse.")
         st.stop()
 
-    # On entraîne des modèles pour les Y choisies (sur le même schéma de formule)
     factors = st.session_state.factors
     df_res = st.session_state.results.copy()
 
-    # Only keep rows with at least one Y filled for those selected
     y_candidates = [y for y in st.session_state.y_cols if y in df_res.columns]
     selected_y = st.multiselect("Réponses à optimiser", y_candidates, default=y_candidates[:1] if y_candidates else [])
-
     if not selected_y:
         st.info("Choisis au moins une réponse.")
         st.stop()
 
-    include_inter = st.checkbox("Modèle: interactions", value=True)
+    include_inter = st.checkbox("Modèle: interactions (quant-quant)", value=True)
     include_quad = st.checkbox("Modèle: quadratique (RSM)", value=False)
     include_block = st.checkbox("Inclure Block", value=True)
 
-    # Goals for each Y
-    st.markdown("### Objectifs")
+    st.markdown("### Objectifs / bornes désirées")
     goals = {}
     for y in selected_y:
         st.markdown(f"**{y}**")
@@ -907,22 +953,22 @@ if step == "Optimisation":
         with c1:
             goal = st.selectbox(f"Objectif ({y})", ["Maximiser", "Minimiser", "Cibler"], key=f"goal_{y}")
         with c2:
-            low = float(st.number_input(f"Seuil bas (désirabilité=0) {y}", value=0.0, key=f"low_{y}"))
+            low = float(st.number_input(f"Seuil bas (D=0) {y}", value=0.0, key=f"low_{y}"))
         with c3:
-            high = float(st.number_input(f"Seuil haut (désirabilité=1) {y}", value=1.0, key=f"high_{y}"))
+            high = float(st.number_input(f"Seuil haut (D=1) {y}", value=1.0, key=f"high_{y}"))
         with c4:
             weight = float(st.number_input(f"Poids {y} (>=1)", value=1.0, min_value=1.0, key=f"w_{y}"))
         target = None
         if goal == "Cibler":
-            target = float(st.number_input(f"Cible {y}", value=(low+high)/2, key=f"t_{y}"))
+            target = float(st.number_input(f"Cible {y}", value=(low + high) / 2, key=f"t_{y}"))
         goals[y] = {"goal": goal, "low": low, "high": high, "target": target, "weight": weight}
 
-    # Fit models
+    # Fit models for selected Y
     models = {}
     for y in selected_y:
         mask = df_res[y].notna()
-        if mask.sum() < 6:
-            st.warning(f"Pas assez de données pour {y} (>=6 recommandé).")
+        if int(mask.sum()) < 6:
+            st.warning(f"Pas assez de points pour {y} (>=6 recommandé).")
             st.stop()
         df_model = df_res.loc[mask].copy()
         if "Block" not in df_model.columns:
@@ -934,63 +980,55 @@ if step == "Optimisation":
             st.error(f"Impossible d’ajuster le modèle pour {y}: {e}")
             st.stop()
 
-    st.markdown("### Recherche du meilleur réglage (random search)")
-    n_samples = st.slider("Nb d'essais virtuels (plus = mieux)", 200, 10000, 2000, 200)
+    n_samples = st.slider("Nb d'essais virtuels", 200, 20000, 2000, 200)
 
     if st.button("🎯 Optimiser"):
         out = optimize_desirability(models, factors, goals, n_samples=int(n_samples), seed=42)
         if out is None:
             st.error("Aucun facteur quantitatif à optimiser (cat seulement).")
             st.stop()
-
-        bestD, best = out
-        x_best, y_pred = best
-
+        bestD, best_x, best_preds = out
         st.success(f"Désirabilité globale = {bestD:.3f}")
-        st.markdown("#### Réglages recommandés (facteurs quantitatifs)")
-        st.dataframe(pd.DataFrame([x_best]), use_container_width=True)
-
+        st.markdown("#### Réglages recommandés (quantitatifs)")
+        st.dataframe(pd.DataFrame([best_x]), use_container_width=True)
         st.markdown("#### Prédictions")
-        st.dataframe(pd.DataFrame([y_pred]), use_container_width=True)
+        st.dataframe(pd.DataFrame([best_preds]), use_container_width=True)
 
 
 # ============================================================
 # 6) RAPPORT
 # ============================================================
 if step == "Rapport":
-    st.subheader("Rapport (simple)")
-    st.write("Génère un résumé téléchargeable (utile pour partager).")
-
+    st.subheader("Rapport (résumé)")
     if st.session_state.doe_real is None:
         st.info("Génère un plan d’abord.")
         st.stop()
 
-    summary = []
-    summary.append("# Rapport DOE\n")
-    summary.append("## Plan\n")
-    summary.append(f"- Plan ID: {st.session_state.plan_id}\n")
+    lines = []
+    lines.append("# Rapport DOE\n")
+    lines.append(f"- Plan ID: {st.session_state.plan_id}\n")
     if st.session_state.design_cfg:
-        summary.append(f"- Type: {st.session_state.design_cfg.design_type}\n")
-        summary.append(f"- Réplicats: {st.session_state.design_cfg.replicates}\n")
-        summary.append(f"- Points centraux: {st.session_state.design_cfg.center_points}\n")
-        summary.append(f"- Blocs: {st.session_state.design_cfg.n_blocks}\n")
+        lines.append(f"- Type: {st.session_state.design_cfg.design_type}\n")
+        lines.append(f"- Réplicats: {st.session_state.design_cfg.replicates}\n")
+        lines.append(f"- Points centraux: {st.session_state.design_cfg.center_points}\n")
+        lines.append(f"- Blocs: {st.session_state.design_cfg.n_blocks}\n")
 
-    summary.append("\n## Facteurs\n")
+    lines.append("\n## Facteurs\n")
     for f in st.session_state.factors:
         if f.kind == "quant":
-            summary.append(f"- {f.name}: [{f.low}, {f.high}] pas={f.step}\n")
+            lines.append(f"- {f.name}: [{f.low}, {f.high}], pas={f.step}\n")
         else:
-            summary.append(f"- {f.name}: cat {f.levels}\n")
+            lines.append(f"- {f.name}: cat {f.levels}\n")
 
-    summary.append("\n## Aperçu plan (10 premières lignes)\n")
-    summary.append(st.session_state.doe_real.head(10).to_markdown(index=False))
-    summary.append("\n")
+    lines.append("\n## Aperçu plan (10 lignes)\n")
+    lines.append(st.session_state.doe_real.head(10).to_markdown(index=False))
 
     if st.session_state.results is not None:
-        summary.append("\n## Remplissage réponses\n")
+        lines.append("\n\n## Remplissage réponses\n")
         for y in st.session_state.y_cols:
             if y in st.session_state.results.columns:
-                summary.append(f"- {y}: {int(st.session_state.results[y].notna().sum())}/{len(st.session_state.results)}\n")
+                lines.append(f"- {y}: {int(st.session_state.results[y].notna().sum())}/{len(st.session_state.results)}\n")
 
-    md = "\n".join(summary).encode("utf-8")
+    md = "\n".join(lines).encode("utf-8")
     st.download_button("Télécharger rapport (MD)", md, file_name="rapport_doe.md", mime="text/markdown")
+
